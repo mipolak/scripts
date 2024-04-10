@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# port checker 
+# if there is only option to use bash built-in functions
+usage() {
+  echo "Usage: $0 ip_address port"
+}
+
+check_args() {
+  if [[ $# -ne 2 ]];
+  then
+    usage
+    exit 1
+  fi
+}
+
+execute_check() {
+  reg_ip="^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+  reg_port="^(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4})$"
+  if [[ "$1" =~ $reg_ip && "$2" =~ $reg_port ]];
+  then
+    { echo >/dev/tcp/"$1"/"$2"; } &>/dev/null && echo "Port is open" || echo "Port is closed"
+  else
+    echo "Provided IP address or port is not valid."
+  fi
+}
+
+check_args "$@"
+execute_check "$@"
