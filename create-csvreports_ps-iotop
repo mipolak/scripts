@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+import sys
+import csv
+import re
+from datetime import datetime
+
+"""
+Parser for collector-script output containing PS snapshot blocks and iotop blocks.
+
+Creates:
+  - process_stats.csv
+  - iotop_stats.csv
+  - iotop_disk_rw_stats.csv
+"""
+
+# Regexes for parsing
+RE_PS_HEADER = re.compile(r"^===== PS Snapshot:\s*(.*)\s*=====")
+RE_BLOCK_END = re.compile(r"^==========\s*$")
+RE_IOTOP_HEADER = re.compile(r"^=== I/O Usage")
+RE_TOTAL_RW = re.compile(
+    r"Total DISK READ:\s*([0-9.]+\s*\S+)\s*\|\s*Total DISK WRITE:\s*([0-9.]+\s*\S+)"
+)
+RE_CURRENT_RW = re.compile(
+    r"Current DISK READ:\s*([0-9.]+\s*\S+)\s*\|\s*Current DISK WRITE:\s*([0-9.]+\s*\S+)"
+)
+
+# PS line approximate structure:
+# PID USER CPU MEM VSZ RSS COMMAND...
+# (The command may contain spaces.)
+RE_PS_LINE = re.compile(
+    r"^\s*(\d+)\s+(\S+)\s+([0-9.]+)\s+([0-9.]+)\s+(\d+)\s+(\d+)\s+(.*)$"
+)
+
+# IOTOP per-process line format:
+# PID  PRIO USER  DISK READ  DISK WRITE  SWAPIN  IO  COMMAND...
+RE_IOTOP_LINE = re.compile(
+    r"^\s*(\d+)\s+(\S+)\s+(\S+)\s+([0-9.]+\s*\S+)\s+([0-9.]+\s*\S+)\s+(\S+)\s+(\S+)\s+(.*)$"
+)
+
+
+def parse_timestamp(ts_str):
+    """Parse timestamp from PS header into a uniform format."""
+    try:
+        # Example: Wed 26 Nov 2025 17:35:25 CET
+        return datetime.strptime(ts_str, "%a %d %b %Y %H:%M:%S %Z")
+    except Exception:
+        # fallback: return original string
+        return ts_str
+
+
+def parse_file(path):
+    """Parse input textual collector output."""
+    ps_rows = []
+    iotop_rows = []
+    disk_rw_rows = []
+
+    current_timestamp = None
+    in_iotop = False
+    expect_iotop_header = False
+
+    totals = {
+        "total_read": None,
+        "total_write": None,
+        "current_read": None,
+        "current_write": None,
+    }
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            # Detect start of PS block
+            m = RE_PS_HEADER.match(line)
+            if m:
+                # When entering new PS block, reset flags
+                ts = parse_timestamp(m.group(1))
+                current_timestamp = ts
+                totals = {
+                    "total_read": None,
+                    "total_write": None,
+                    "current_read": None,
+                    "current_write": None,
+                }
+                in_iotop = False
+                expect_iotop_header = False
+                continue
+
+            # Detect end of this timestamp block
+            if RE_BLOCK_END.match(line):
+                # Save disk RW metrics for timestamp
+                if current_timestamp is not None:
+                    disk_rw_rows.append({
+                        "timestamp": current_timestamp,
+                        "total_disk_read": totals["total_read"],
+                        "total_disk_write": totals["total_write"],
+                        "current_disk_read": totals["current_read"],
+                        "current_disk_write": totals["current_write"],
+                    })
+
+                current_timestamp = None
+                in_iotop = False
+                expect_iotop_header = False
+                continue
+
+            if current_timestamp is None:
+                continue  # skip until next timestamp block
+
+            # Detect iotop section header
+            if RE_IOTOP_HEADER.search(line):
+                in_iotop = True
+                expect_iotop_header = True
+                continue
+
+            # Parse totals in iotop section
+            if in_iotop:
+                m_tot = RE_TOTAL_RW.search(line)
+                if m_tot:
+                    totals["total_read"] = m_tot.group(1)
+                    totals["total_write"] = m_tot.group(2)
+                    continue
+
+                m_cur = RE_CURRENT_RW.search(line)
+                if m_cur:
+                    totals["current_read"] = m_cur.group(1)
+                    totals["current_write"] = m_cur.group(2)
+                    continue
+
+                # Skip the column header line: "PID PRIO USER ..."
+                if expect_iotop_header and line.strip().startswith("PID"):
+                    expect_iotop_header = False
+                    continue
+
+                # Try to parse IOTOP process line
+                mi = RE_IOTOP_LINE.match(line)
+                if mi:
+                    iotop_rows.append({
+                        "timestamp": current_timestamp,
+                        "pid": mi.group(1),
+                        "prio": mi.group(2),
+                        "user": mi.group(3),
+                        "disk_read": mi.group(4),
+                        "disk_write": mi.group(5),
+                        "swapin": mi.group(6),
+                        "io": mi.group(7),
+                        "command": mi.group(8),
+                    })
+                continue
+
+            # Parse PS lines (only when not in IOTOP)
+            mps = RE_PS_LINE.match(line)
+            if mps:
+                ps_rows.append({
+                    "timestamp": current_timestamp,
+                    "pid": mps.group(1),
+                    "user": mps.group(2),
+                    "cpu": mps.group(3),
+                    "mem": mps.group(4),
+                    "vsz": mps.group(5),
+                    "rss": mps.group(6),
+                    "command": mps.group(7),
+                })
+                continue
+
+    return ps_rows, iotop_rows, disk_rw_rows
+
+
+def write_csv(filename, rows, fieldnames):
+    """Write list of dict rows to a CSV file."""
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            out = {}
+            for k in fieldnames:
+                v = r.get(k)
+                if isinstance(v, datetime):
+                    v = v.isoformat()
+                out[k] = v
+            w.writerow(out)
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python3 parse_metrics.py input.txt")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+
+    ps_rows, iotop_rows, disk_rw_rows = parse_file(input_file)
+
+    # Determine CSV columns
+    ps_fields = ["timestamp", "pid", "user", "cpu", "mem", "vsz", "rss", "command"]
+    iotop_fields = [
+        "timestamp", "pid", "prio", "user",
+        "disk_read", "disk_write", "swapin", "io", "command"
+    ]
+    disk_fields = [
+        "timestamp",
+        "total_disk_read",
+        "total_disk_write",
+        "current_disk_read",
+        "current_disk_write"
+    ]
+
+    write_csv("process_stats.csv", ps_rows, ps_fields)
+    write_csv("iotop_stats.csv", iotop_rows, iotop_fields)
+    write_csv("iotop_disk_rw_stats.csv", disk_rw_rows, disk_fields)
+
+    print("Generated:")
+    print("  process_stats.csv")
+    print("  iotop_stats.csv")
+    print("  iotop_disk_rw_stats.csv")
+
+
+if __name__ == "__main__":
+    main()
